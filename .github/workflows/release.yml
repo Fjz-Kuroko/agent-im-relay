@@ -152,7 +152,7 @@ jobs:
             exit 1
           fi
       - name: Publish package
-        run: pnpm --filter ./apps/agent-inbox publish --access public --provenance --no-git-checks
+        run: cd apps/agent-inbox && npm publish --access public --provenance --no-git-checks
 
   create-release:
     name: Create GitHub Release
