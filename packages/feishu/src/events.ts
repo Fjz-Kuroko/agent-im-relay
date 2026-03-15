@@ -2,16 +2,20 @@ import { readFile } from 'node:fs/promises';
 import {
   applyMessageControlDirectives,
   initState,
+  maybeUnrefTimer,
   persistState,
   preprocessConversationMessage,
   processedEventIds,
   processedMessages,
+  resolvePermissionRequest,
   type BackendName,
 } from '@agent-im-relay/core';
 import { createFeishuClient } from './api';
 import type { FeishuConfig } from './config';
 import {
   buildFeishuBackendConfirmationCardPayload,
+  buildFeishuPermissionCardPayload,
+  buildPermissionRequestCard,
 } from './cards';
 import { formatFeishuTextMessages } from './formatting';
 import {
@@ -135,12 +139,6 @@ type DedupClaim = {
   duplicate: boolean;
   complete(succeeded: boolean): void;
 };
-
-function maybeUnrefTimer(timer: ReturnType<typeof setTimeout>): void {
-  if (typeof (timer as { unref?: () => void }).unref === 'function') {
-    (timer as { unref: () => void }).unref();
-  }
-}
 
 function scheduleProcessedKey(
   store: ProcessedKeyStore,
@@ -744,6 +742,40 @@ export function createFeishuEventRouter(
           target,
           transport,
         });
+        succeeded = true;
+        return;
+      }
+
+      if (actionType === 'permission-approve' || actionType === 'permission-deny') {
+        const requestId = typeof action.requestId === 'string' ? action.requestId : undefined;
+        if (!requestId || !target.replyToMessageId) {
+          succeeded = true;
+          return;
+        }
+
+        try {
+          const resolved = resolvePermissionRequest({
+            conversationId,
+            requestId,
+            decision: actionType === 'permission-approve' ? 'approved' : 'denied',
+          });
+          await transport.updateCard(
+            target,
+            target.replyToMessageId,
+            buildFeishuPermissionCardPayload(
+              buildPermissionRequestCard(
+                conversationId,
+                requestId,
+                typeof action.tool === 'string' ? action.tool : undefined,
+                typeof action.reason === 'string' ? action.reason : undefined,
+              ),
+              buildFeishuCardContext(conversationId, target),
+              resolved.decision,
+            ),
+          );
+        } catch {
+          await transport.sendText(target, 'This permission request is no longer pending.');
+        }
         succeeded = true;
         return;
       }

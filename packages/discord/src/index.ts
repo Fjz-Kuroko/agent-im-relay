@@ -22,6 +22,7 @@ import {
   initState,
   listSkills,
   Orchestrator,
+  resolvePermissionRequest,
   type IncomingMessage,
   preprocessConversationMessage,
 } from '@agent-im-relay/core';
@@ -44,6 +45,10 @@ import {
   skillCommand,
 } from './commands/skill';
 import { promptThreadSetup, applySetupResult } from './commands/thread-setup';
+import {
+  buildDiscordPermissionMessage,
+  parseDiscordPermissionCustomId,
+} from './permissions';
 
 function isChannelAllowed(channelId: string, parentId: string | null): boolean {
   if (config.allowedChannelIds.length === 0) return true;
@@ -343,6 +348,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!handler) return;
 
       await handler(interaction);
+      return;
+    }
+
+    if ('isButton' in interaction && interaction.isButton()) {
+      const parsed = parseDiscordPermissionCustomId(interaction.customId);
+      if (!parsed) {
+        return;
+      }
+
+      try {
+        const resolved = resolvePermissionRequest(parsed);
+        await interaction.update(buildDiscordPermissionMessage({
+          conversationId: parsed.conversationId,
+          requestId: parsed.requestId,
+        }, resolved.decision === 'timeout' ? 'timeout' : resolved.decision));
+      } catch {
+        await interaction.reply({
+          content: 'This permission request is no longer pending.',
+          ephemeral: true,
+        });
+      }
     }
   } catch (error) {
     const errorText = toErrorMessage(error);

@@ -12,6 +12,7 @@ import {
 } from '../backend';
 import { buildEnvironment } from '../environment';
 import type { AgentSessionOptions, AgentStreamEvent } from '../session';
+import type { PermissionMode } from '../tools';
 
 const WORKING_DIR_PATTERN = /^Working directory:\s*(.+)$/;
 const LOG_LINE_PATTERN = /^\d{4}-\d{2}-\d{2}T/;
@@ -36,6 +37,32 @@ function formatCommandSummary(command: string): string {
   return `running Bash ${safeJson({ command }).slice(0, 600)}`;
 }
 
+function writeCodexPrompt(
+  stdin: NodeJS.WritableStream | null | undefined,
+  prompt: string,
+  keepOpen: boolean,
+): void {
+  if (!stdin) {
+    return;
+  }
+
+  if (keepOpen) {
+    stdin.write(prompt);
+    if (!prompt.endsWith('\n')) {
+      stdin.write('\n');
+    }
+    return;
+  }
+
+  stdin.end(prompt);
+}
+
+type ExtractedPermissionRequest = {
+  requestId: string;
+  tool?: string;
+  reason?: string;
+};
+
 function extractCodexSessionId(payload: unknown): string | undefined {
   if (!isRecord(payload)) return undefined;
   const type = asString(payload.type);
@@ -56,12 +83,68 @@ function isAuthoritativeCodexResumeFailure(error: string): boolean {
   ].some(pattern => pattern.test(error));
 }
 
-export function createCodexArgs(options: AgentSessionOptions): string[] {
+export function extractCodexPermissionRequest(payload: unknown): ExtractedPermissionRequest | undefined {
+  if (!isRecord(payload)) return undefined;
+
+  const legacyType = asString(payload.type);
+  if (legacyType === 'permission.requested') {
+    const requestId = asString(payload.id);
+    if (!requestId) return undefined;
+    return {
+      requestId,
+      tool: asString(payload.tool),
+      reason: asString(payload.reason),
+    };
+  }
+
+  const method = asString(payload.method);
+  const requestId = asString(payload.id);
+  if (!method || !requestId) return undefined;
+
+  const params = isRecord(payload.params) ? payload.params : {};
+  if (method === 'item/commandExecution/requestApproval') {
+    const command = Array.isArray(params.command)
+      ? params.command.filter((value): value is string => typeof value === 'string').join(' ')
+      : undefined;
+    return {
+      requestId,
+      tool: 'Bash',
+      reason: asString(params.reason) ?? command,
+    };
+  }
+
+  if (method === 'item/fileChange/requestApproval') {
+    return {
+      requestId,
+      tool: 'Patch',
+      reason: asString(params.reason),
+    };
+  }
+
+  return undefined;
+}
+
+export function formatCodexPermissionDecision(
+  requestId: string,
+  decision: 'approved' | 'denied',
+): string {
+  return `${JSON.stringify({
+    id: requestId,
+    result: {
+      decision: decision === 'approved' ? 'accept' : 'decline',
+    },
+  })}\n`;
+}
+
+export function createCodexArgs(
+  options: AgentSessionOptions,
+  permissionMode: PermissionMode = config.permissionMode,
+): string[] {
   const args = options.resumeSessionId
     ? ['exec', 'resume', options.resumeSessionId, '--json', '--skip-git-repo-check']
     : ['exec', '--json', '--skip-git-repo-check'];
 
-  if (options.mode === 'code') {
+  if (options.mode === 'code' && permissionMode !== 'safe') {
     args.push('--full-auto');
   }
 
@@ -199,7 +282,8 @@ async function* streamCodex(options: AgentSessionOptions): AsyncGenerator<AgentS
     ? options.prompt
     : `请在开始任务前，先找到与本任务相关的项目目录，并在响应的第一行输出：Working directory: /absolute/path，然后再执行任务。\n\n${options.prompt}`;
 
-  const args = createCodexArgs(options);
+  const permissionMode = config.permissionMode;
+  const args = createCodexArgs({ ...options, prompt }, permissionMode);
 
   const child = spawn(config.codexBin, args, {
     cwd,
@@ -207,7 +291,7 @@ async function* streamCodex(options: AgentSessionOptions): AsyncGenerator<AgentS
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 
-  child.stdin?.end(prompt);
+  writeCodexPrompt(child.stdin, prompt, permissionMode === 'safe');
 
   const closePromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
     (resolve, reject) => {
@@ -244,6 +328,34 @@ async function* streamCodex(options: AgentSessionOptions): AsyncGenerator<AgentS
   try {
     if (!stdoutReader) throw new Error('Codex CLI stdout is unavailable');
 
+    let registerPermissionRequest:
+      | ((options: {
+        conversationId: string;
+        requestId: string;
+        backend: string;
+        tool?: string;
+        reason?: string;
+        timeoutMs: number;
+      }) => {
+        requestId: string;
+        backend: string;
+        tool?: string;
+        reason?: string;
+        expiresAt: string;
+      })
+      | undefined;
+
+    if (permissionMode === 'safe' && options.conversationId && child.stdin) {
+      const runtime = await import('../runtime.js');
+      runtime.registerConversationPermissionResponder(options.conversationId, {
+        backend: 'codex',
+        respond(requestId, decision) {
+          child.stdin?.write(formatCodexPermissionDecision(requestId, decision));
+        },
+      });
+      registerPermissionRequest = runtime.registerPermissionRequest;
+    }
+
     for await (const rawLine of stdoutReader) {
       const line = rawLine.trimEnd();
       if (!line) continue;
@@ -260,6 +372,29 @@ async function* streamCodex(options: AgentSessionOptions): AsyncGenerator<AgentS
       }
 
       sessionId = extractCodexSessionId(parsed) ?? sessionId;
+
+      if (registerPermissionRequest && options.conversationId) {
+        const permissionRequest = extractCodexPermissionRequest(parsed);
+        if (permissionRequest) {
+          const request = registerPermissionRequest({
+            conversationId: options.conversationId,
+            requestId: permissionRequest.requestId,
+            backend: 'codex',
+            tool: permissionRequest.tool,
+            reason: permissionRequest.reason,
+            timeoutMs: config.permissionRequestTimeoutMs,
+          });
+          yield {
+            type: 'permission-requested',
+            requestId: request.requestId,
+            backend: request.backend,
+            tool: request.tool,
+            reason: request.reason,
+            expiresAt: request.expiresAt,
+          };
+          continue;
+        }
+      }
 
       for (const event of extractCodexEvents(parsed, { resumeSessionId: options.resumeSessionId })) {
         if (event.type === 'text') {

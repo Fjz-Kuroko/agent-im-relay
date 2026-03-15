@@ -9,6 +9,8 @@ import {
   getAvailableBackendCapabilities,
   getAvailableBackendNames,
   listSkills,
+  maybeUnrefTimer,
+  resolvePermissionRequest,
   resolveBackendModelId,
   runPlatformConversation,
   type AgentStreamEvent,
@@ -16,7 +18,12 @@ import {
   type BackendName,
   type AgentMode,
 } from '@agent-im-relay/core';
-import { buildSlackBackendSelectionBlocks, buildSlackModelSelectionBlocks, type SlackBlock } from './cards';
+import {
+  buildSlackBackendSelectionBlocks,
+  buildSlackModelSelectionBlocks,
+  buildSlackPermissionBlocks,
+  type SlackBlock,
+} from './cards';
 import { parseSlackAskCommand } from './commands/ask';
 import { parseSlackCodeCommand } from './commands/code';
 import { resolveSlackDoneTarget } from './commands/done';
@@ -115,19 +122,18 @@ type SlackPendingRun = {
 // TODO(slack): persist pending runs via resolveSlackPendingRunStateFile once restart-resume is required.
 const pendingRuns = new Map<string, SlackPendingRun>();
 const pendingModelTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const pendingPermissions = new Map<string, {
+  target: { channelId: string; threadTs: string };
+  messageTs: string;
+  tool?: string;
+  reason?: string;
+}>();
 
 function hasReactionTransport(
   transport: SlackRuntimeTransport,
 ): transport is SlackRuntimeTransport & Required<Pick<SlackRuntimeTransport, 'addReaction' | 'removeReaction'>> {
   return typeof transport.addReaction === 'function' && typeof transport.removeReaction === 'function';
 }
-
-function maybeUnrefTimer(timer: ReturnType<typeof setTimeout>): void {
-  if (typeof (timer as { unref?: () => void }).unref === 'function') {
-    (timer as { unref: () => void }).unref();
-  }
-}
-
 function clearPendingTimer(conversationId: string): void {
   const timer = pendingModelTimers.get(conversationId);
   if (!timer) {
@@ -141,6 +147,10 @@ function clearPendingTimer(conversationId: string): void {
 function resetPendingRun(conversationId: string): void {
   clearPendingTimer(conversationId);
   pendingRuns.delete(conversationId);
+}
+
+function permissionKey(conversationId: string, requestId: string): string {
+  return `${conversationId}:${requestId}`;
 }
 
 function buildRuntimeConversationRecord(created: {
@@ -391,6 +401,58 @@ async function publishBlocks(
   pendingRun.cardMessageTs = await transport.sendBlocks(pendingRun.target, text, blocks) ?? pendingRun.cardMessageTs;
 }
 
+async function publishPermissionRequest(
+  transport: SlackRuntimeTransport,
+  pendingRun: SlackPendingRun,
+  event: Extract<AgentStreamEvent, { type: 'permission-requested' }>,
+): Promise<void> {
+  const messageTs = await transport.sendBlocks(
+    pendingRun.target,
+    'Permission Required',
+    buildSlackPermissionBlocks({
+      conversationId: pendingRun.conversationId,
+      requestId: event.requestId,
+      tool: event.tool,
+      reason: event.reason,
+    }),
+  );
+
+  if (messageTs) {
+    pendingPermissions.set(permissionKey(pendingRun.conversationId, event.requestId), {
+      target: pendingRun.target,
+      messageTs,
+      tool: event.tool,
+      reason: event.reason,
+    });
+  }
+}
+
+async function updatePermissionState(
+  transport: SlackRuntimeTransport,
+  conversationId: string,
+  requestId: string,
+  decision: 'approved' | 'denied' | 'timeout',
+): Promise<void> {
+  const key = permissionKey(conversationId, requestId);
+  const pending = pendingPermissions.get(key);
+  if (!pending) {
+    return;
+  }
+
+  await transport.updateBlocks(
+    pending.target,
+    pending.messageTs,
+    'Permission Required',
+    buildSlackPermissionBlocks({
+      conversationId,
+      requestId,
+      tool: pending.tool,
+      reason: pending.reason,
+    }, decision),
+  );
+  pendingPermissions.delete(key);
+}
+
 async function continuePendingRun(
   options: SlackRuntimeOptions,
   pendingRun: SlackPendingRun,
@@ -485,6 +547,17 @@ async function continuePendingRun(
       transport: options.transport,
       target: target as { channelId: string; threadTs: string },
       updateIntervalMs: options.config?.streamUpdateIntervalMs ?? 1_000,
+      onPermissionRequested: async (event) => {
+        await publishPermissionRequest(options.transport, pendingRun, event);
+      },
+      onPermissionResolved: async (event) => {
+        await updatePermissionState(
+          options.transport,
+          pendingRun.conversationId,
+          event.requestId,
+          event.decision,
+        );
+      },
     }, events),
     onPhaseChange: async (phase, previousPhase, trigger) => {
       if (!trigger || !hasReactionTransport(options.transport)) {
@@ -541,6 +614,7 @@ export function resetSlackRuntimeForTests(): void {
   }
   pendingModelTimers.clear();
   pendingRuns.clear();
+  pendingPermissions.clear();
 }
 
 export function hasPendingSlackRun(conversationId: string): boolean {
@@ -708,6 +782,38 @@ export function createSlackRuntime(options: SlackRuntimeOptions): SlackRuntime {
       }));
     }
 
+    if (actionType === 'permission') {
+      if (typeof payload['requestId'] !== 'string' || (payload['decision'] !== 'approved' && payload['decision'] !== 'denied')) {
+        return {
+          kind: 'error' as const,
+          message: 'Invalid Slack permission action payload.',
+        };
+      }
+
+      try {
+        const resolved = resolvePermissionRequest({
+          conversationId,
+          requestId: payload['requestId'],
+          decision: payload['decision'],
+        });
+        await updatePermissionState(
+          options.transport,
+          conversationId,
+          payload['requestId'],
+          resolved.decision,
+        );
+        return {
+          kind: 'resolved' as const,
+          conversationId,
+        };
+      } catch {
+        return {
+          kind: 'error' as const,
+          message: 'This permission request is no longer pending.',
+        };
+      }
+    }
+
     return {
       kind: 'error' as const,
       message: `Unsupported Slack action type: ${actionType}`,
@@ -827,7 +933,7 @@ export function createSlackRuntime(options: SlackRuntimeOptions): SlackRuntime {
     });
     app.action(/.*/, async ({ body, ack, action }: any) => {
       await ack();
-      await handleAction({
+      const result = await handleAction({
         channel: { id: body.channel.id },
         message: {
           ts: body.message.ts,
@@ -836,6 +942,22 @@ export function createSlackRuntime(options: SlackRuntimeOptions): SlackRuntime {
         actions: [action],
         user: { id: body.user.id },
       });
+      if (result.kind === 'error') {
+        const threadTs = body.message.thread_ts ?? body.message.ts;
+        const postEphemeral = (app as any).client?.chat?.postEphemeral;
+        if (typeof postEphemeral === 'function') {
+          await postEphemeral({
+            channel: body.channel.id,
+            user: body.user.id,
+            text: result.message,
+            ...(threadTs ? { thread_ts: threadTs } : {}),
+          }).catch(async () => {
+            await options.transport.sendText({ channelId: body.channel.id, threadTs }, result.message);
+          });
+          return;
+        }
+        await options.transport.sendText({ channelId: body.channel.id, threadTs }, result.message);
+      }
     });
     app.event('app_mention', async ({ event }: any) => {
       await handleAppMention(event as SlackMessageEvent);
