@@ -41,16 +41,34 @@ type ExtractedPermissionRequest = {
   reason?: string;
 };
 
-function findPermissionRequestInRecord(record: Record<string, unknown>): ExtractedPermissionRequest | undefined {
+function formatClaudePermissionReason(toolInput: unknown): string | undefined {
+  if (!isRecord(toolInput)) {
+    return toolInput === undefined ? undefined : safeJson(toolInput);
+  }
+
+  const command = asString(toolInput.command);
+  if (command) {
+    return command;
+  }
+
+  return safeJson(toolInput);
+}
+
+function findControlPermissionRequest(record: Record<string, unknown>): ExtractedPermissionRequest | undefined {
   const requestId = asString(record.request_id) ?? asString(record.requestId) ?? asString(record.id);
   if (!requestId) {
     return undefined;
   }
 
+  const request = isRecord(record.request) ? record.request : undefined;
+  if (!request || asString(request.subtype) !== 'can_use_tool') {
+    return undefined;
+  }
+
   return {
     requestId,
-    tool: asString(record.tool_name) ?? asString(record.toolName) ?? asString(record.name),
-    reason: asString(record.reason) ?? asString(record.message) ?? asString(record.description),
+    tool: asString(request.tool_name) ?? asString(request.toolName) ?? asString(request.name),
+    reason: formatClaudePermissionReason(request.input),
   };
 }
 
@@ -67,24 +85,8 @@ function formatClaudeUserMessage(text: string): string {
 export function extractClaudePermissionRequest(payload: unknown): ExtractedPermissionRequest | undefined {
   if (!isRecord(payload)) return undefined;
 
-  if (asString(payload.type) === 'permission_request') {
-    return findPermissionRequestInRecord(payload);
-  }
-
-  if (asString(payload.type) === 'stream_event' && isRecord(payload.event)) {
-    const eventType = asString(payload.event.type);
-    if (eventType === 'permission_request') {
-      return findPermissionRequestInRecord(payload.event);
-    }
-  }
-
-  if (asString(payload.type) === 'assistant' && isRecord(payload.message) && Array.isArray(payload.message.content)) {
-    for (const block of payload.message.content) {
-      if (!isRecord(block) || asString(block.type) !== 'permission_request') {
-        continue;
-      }
-      return findPermissionRequestInRecord(block);
-    }
+  if (asString(payload.type) === 'control_request') {
+    return findControlPermissionRequest(payload);
   }
 
   return undefined;
@@ -94,11 +96,16 @@ export function formatClaudePermissionDecision(
   requestId: string,
   decision: 'approved' | 'denied',
 ): string {
-  return formatClaudeUserMessage(
-    decision === 'approved'
-      ? `Permission request ${requestId} approved. Continue with the operation.`
-      : `Permission request ${requestId} denied. Skip that operation and continue.`,
-  );
+  return `${JSON.stringify({
+    type: 'control_response',
+    response: {
+      subtype: 'success',
+      request_id: requestId,
+      response: decision === 'approved'
+        ? { behavior: 'allow' }
+        : { behavior: 'deny', message: 'User denied' },
+    },
+  })}\n`;
 }
 
 function extractContentEvents(content: unknown): AgentStreamEvent[] {
@@ -370,13 +377,13 @@ async function* streamClaude(options: AgentSessionOptions): AsyncGenerator<Agent
     let registerPermissionRequest:
       | ((options: {
         conversationId: string;
-        requestId: string;
+        requestId: string | number;
         backend: string;
         tool?: string;
         reason?: string;
         timeoutMs: number;
       }) => {
-        requestId: string;
+        requestId: string | number;
         backend: string;
         tool?: string;
         reason?: string;
@@ -393,7 +400,7 @@ async function* streamClaude(options: AgentSessionOptions): AsyncGenerator<Agent
       registerConversationPermissionResponder(options.conversationId, {
         backend: 'claude',
         respond(requestId, decision) {
-          child.stdin?.write(formatClaudePermissionDecision(requestId, decision));
+          child.stdin?.write(formatClaudePermissionDecision(String(requestId), decision));
         },
       });
       registerPermissionRequest = registerPermissionRequestWithRuntime;
