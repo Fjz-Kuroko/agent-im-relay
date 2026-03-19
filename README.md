@@ -1,6 +1,6 @@
 # Agent Inbox
 
-> Let local AI agents such as Claude Code and Codex receive tasks and reply with results directly inside Discord, Feishu, and other IM platforms, without any server. Everything runs on your own machine.
+> Let local AI agents such as Claude Code and Codex receive tasks and reply with results directly inside Discord, Feishu, Slack, and other IM platforms, without any server. Everything runs on your own machine.
 
 [![npm version](https://img.shields.io/npm/v/@doctorwu/agent-inbox)](https://www.npmjs.com/package/@doctorwu/agent-inbox)
 [![GitHub release](https://img.shields.io/github/v/release/Doctor-wu/agent-im-relay)](https://github.com/Doctor-wu/agent-im-relay/releases)
@@ -8,16 +8,18 @@
 ![TypeScript](https://img.shields.io/badge/language-TypeScript-3178C6)
 [![Discord](https://img.shields.io/badge/platform-Discord-5865F2)](https://discord.com)
 [![Feishu](https://img.shields.io/badge/platform-Feishu-00B96B)](https://open.feishu.cn)
+[![Slack](https://img.shields.io/badge/platform-Slack-4A154B)](https://slack.com)
 
 ---
 
 ## Why Agent Inbox
 
 - **Inbox-first workflow** - Send a message to the bot in your IM app, let the agent open a session automatically, execute the task, and send the result back with file upload and download support.
-- **Multiple IM platforms** - Discord and Feishu are supported today, and the architecture is designed to extend cleanly to additional platforms.
+- **Multiple IM platforms** - Discord, Feishu, and Slack are supported today, and the architecture is designed to extend cleanly to additional platforms.
 - **Multiple agent backends** - Switch between Claude Code and OpenAI Codex depending on the task.
 - **Runs locally with full data control** - Configuration and runtime state live in `~/.agent-inbox/`, with no cloud deployment required.
 - **Persistent sessions** - Keep context across messages, interrupt and resume work, and isolate each session in its own working directory.
+- **Safe-mode approvals in IM** - When enabled, dangerous backend actions are surfaced as approval cards/buttons in your chat.
 
 ---
 
@@ -33,7 +35,7 @@ npx @doctorwu/agent-inbox
 
 ### Step 2: Configure
 
-On first launch, Agent Inbox starts an interactive setup wizard that walks you through the IM platform and agent backend configuration.
+On first launch, Agent Inbox starts an interactive setup wizard that walks you through IM platform configuration. Backend/model selection is done per conversation through platform controls.
 
 Configuration is stored in `~/.agent-inbox/config.jsonl`. Example:
 
@@ -54,6 +56,7 @@ agent-inbox
 ```
 
 After startup, send a message to your configured bot to begin interacting with the agent.
+Only one running instance is allowed per platform on the same machine.
 
 ---
 
@@ -61,8 +64,17 @@ After startup, send a message to your configured bot to begin interacting with t
 
 | Platform | Status | Notes |
 |------|------|------|
-| **Discord** ⭐ Recommended | ✅ Supported | Slash commands + thread sessions, file upload/download support, streaming output |
-| **Feishu (Lark)** | ✅ Supported | Long-connection mode, DM-triggered session groups, interrupt cards on every message |
+| **Discord** ⭐ Recommended | ✅ Supported | Slash commands + mention-driven thread sessions, attachment ingest and artifact upload, streaming output |
+| **Feishu (Lark)** | ✅ Supported | Long-connection mode, private-chat launcher, session/group chat continuation, interactive control cards |
+| **Slack** | ✅ Supported | Slash commands + app mentions + DM/thread continuation, backend/model selection blocks, safe-mode approval blocks |
+
+## Platform Features
+
+| Platform | How to start a run | Session controls | Files |
+|------|------|------|------|
+| **Discord** | `/code`, `/ask`, `/skill`, or `@mention` | `/interrupt`, `/done`, `/model`, `/effort`, `/sessions`, `/cwd`, `/compact`; backend/model selection cards on first run | Slash commands accept attachment options (up to 3) and mention messages ingest message attachments; outgoing artifacts are uploaded back |
+| **Feishu** | Send a message in session/group chat, or use private chat launcher; `/ask <prompt>` for ask mode | Interactive cards for interrupt/backend/model/effort/done, plus backend switch confirmation | Message files are ingested and usable in run context; generated files can be uploaded back |
+| **Slack** | `/code`, `/ask`, `/skill`, app mention, DM message, or thread reply | `/interrupt`, `/done`; backend/model picked via Block Kit buttons; safe-mode approval buttons | Text-first workflow (no built-in Slack file ingest/upload pipeline yet) |
 
 ### Discord Setup
 
@@ -75,6 +87,9 @@ Discord is the recommended platform for the best interactive workflow. It suppor
 - `/skill <name> <prompt>` — Invoke a predefined skill directly
 - `/model <name>` — Switch the active agent model
 - `/effort <level>` — Set the agent effort level
+- `/sessions` — List active sessions
+- `/cwd set|show|clear` — Manage thread-level working directory override
+- `/compact` — Ask the agent to summarize current thread context
 - `/interrupt` — Interrupt the current task
 - `/done` — End the current session
 - `@mention` — Mention the bot in a channel to trigger a conversation there as well
@@ -82,6 +97,21 @@ Discord is the recommended platform for the best interactive workflow. It suppor
 ### Feishu Setup
 
 Create a self-built enterprise application in the [Feishu Open Platform](https://open.feishu.cn), enable long-connection event subscriptions, and obtain the `App ID` and `App Secret`.
+
+### Slack Setup
+
+Create a Slack app with slash commands and Socket Mode, then collect `botToken`, `appToken`, and `signingSecret`.
+
+## Inline Backend Control Tag
+
+In mention/message flows, you can switch backend inline by embedding:
+
+```text
+<set-backend>codex</set-backend>
+Please continue this task.
+```
+
+The tag is removed before sending prompt text to the backend. If multiple valid tags are present, the last one wins.
 
 ---
 
@@ -93,7 +123,7 @@ Create a self-built enterprise application in the [Feishu Open Platform](https:/
 | **OpenAI Codex** | OpenAI Codex CLI with streaming output |
 | **OpenCode** | Optional fallback backend with no known safe-mode approval protocol |
 
-You can switch the backend for the current session through the setup wizard or IM commands.
+You can switch backend/model per conversation through platform controls (Discord commands/cards, Feishu cards, Slack buttons), and via inline `<set-backend>...</set-backend>` tags in message flows.
 
 ---
 
@@ -146,14 +176,43 @@ Example:
 
 ---
 
+## Runtime Configuration
+
+All runtime knobs live in the `runtime` record inside `~/.agent-inbox/config.jsonl`.
+
+| Key | Default | Description |
+|------|------|------|
+| `agentTimeoutMs` | `600000` | Max duration per agent run before timeout |
+| `artifactRetentionDays` | `14` | Artifact retention window |
+| `artifactMaxSizeBytes` | `8388608` | Max incoming/outgoing artifact size |
+| `streamUpdateIntervalMs` | `1000` | Streaming flush interval for Discord/Slack |
+| `discordMessageCharLimit` | `1900` | Per-message chunking limit on Discord |
+| `permissionMode` | `auto` | `auto` or `safe` |
+| `permissionRequestTimeoutMs` | `120000` | Timeout per approval request in safe mode |
+| `claudeCwd` | `process.cwd()` | Default working directory when no thread override is set |
+| `claudeBin` | `claude` | Claude CLI executable |
+| `codexBin` | `codex` | Codex CLI executable |
+| `opencodeBin` | `opencode` | OpenCode CLI executable |
+
+Useful IM-specific optional fields:
+
+- Discord IM record: `guildIds`, `allowedChannelIds`
+- Feishu IM record: `baseUrl`, `port`, `modelSelectionTimeoutMs`, `verificationToken`, `encryptKey`
+- Slack IM record: `socketMode`
+
+---
+
 ## Runtime Directory Layout
 
 ```text
 ~/.agent-inbox/
   config.jsonl        # Main configuration file
-  state/              # Persistent session state
+  state/
+    sessions.json     # Persistent session/control state across platforms
+    feishu-session-chats.json  # Feishu private-launch session chat mapping
   artifacts/          # File exchange directory (incoming / outgoing)
   logs/               # Runtime logs
+  pids/               # Per-platform single-instance lock files
 ```
 
 ---
@@ -168,6 +227,7 @@ packages/
   core/               @agent-im-relay/core    - Shared runtime, session management, and backend abstractions
   discord/            @agent-im-relay/discord - Discord adapter
   feishu/             @agent-im-relay/feishu  - Feishu adapter
+  slack/              @agent-im-relay/slack   - Slack adapter
 ```
 
 Architecture design document: [docs/agent-inbox-architecture.md](docs/agent-inbox-architecture.md)
